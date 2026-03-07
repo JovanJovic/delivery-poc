@@ -996,8 +996,8 @@ def undeliver_page(token: str, order_no: str):
             <div class="small">Reason</div>
             <select id="reason" name="reason_code" required>
               <option value="CUST_NOT_PRESENT">Customer not present</option>
+              <option value="DAMAGED">Damaged</option>
               <option value="OTHER">Other</option>
-              <option value="BORED">I could not be bothered ...</option>
             </select>
 
             <div id="otherWrap" style="margin-top:12px;">
@@ -1033,8 +1033,6 @@ async def undeliver_submit(
         return HTMLResponse("<h3>Run expired</h3>", status_code=410)
 
     note = (reason_text or "").strip() if reason_code == "OTHER" else None
-    if reason_code == "BORED":
-        note = "I could not be bothered ..."
 
     update_order_firestore(token, order_no, {
         "state": "UNDELIVERED",
