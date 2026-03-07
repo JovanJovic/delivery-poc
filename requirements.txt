@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+pandas
+openpyxl
+google-cloud-firestore
+google-cloud-storage
+python-multipart
