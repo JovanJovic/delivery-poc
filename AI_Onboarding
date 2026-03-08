@@ -1,0 +1,204 @@
+Project: Delivery PoC Web App
+
+Purpose
+This is a proof-of-concept delivery web app for drivers.
+It is designed to let an admin create a run from an Excel export, generate a driver web link + QR code, and let the driver mark deliveries as delivered or no delivery from a mobile phone.
+
+Tech Stack
+- Python
+- FastAPI
+- Cloud Run (Google Cloud)
+- Firestore (run + order persistence)
+- Google Cloud Storage (POD photo + signature storage)
+- Simple server-rendered HTML/CSS/JS, no frontend framework
+- Mobile-first browser use
+
+Hosting / Infra
+- Hosted on Google Cloud Run
+- Firestore is enabled in Native mode
+- Cloud Storage bucket is configured through env var POD_BUCKET
+- Firestore is the source of truth
+- In-memory cache may exist for convenience, but persistence must rely on Firestore
+
+Core Business Flow
+1. Admin uploads an Excel file exported from an internal system.
+2. Excel headers are on row 2, row 1 must be ignored.
+3. Required columns are:
+   - Order
+   - PC
+   - CP
+   - PL
+   - LP
+   - Account Name
+   - Del Suburb
+   - Street
+   - Building
+4. Admin also enters:
+   - Run Number
+   - optional Driver Email
+   - required POD report email
+5. System creates a run, stores it in Firestore, and generates:
+   - a driver link
+   - a QR code for the driver to scan
+6. Driver opens the run on phone and sees a list of orders.
+7. Driver clicks an order and gets options:
+   - NAVIGATE
+   - DELIVER
+   - NO DELIVERY
+8. DELIVER flow:
+   - photo is mandatory
+   - multiple photos allowed
+   - signature is optional
+   - photo(s) and signature are uploaded to Cloud Storage
+   - Firestore order state becomes DELIVERED
+9. NO DELIVERY flow:
+   - reasons include:
+     - CUST_NOT_PRESENT
+     - OTHER
+     - BORED ("I could not be bothered ...") -> intentional easter egg
+   - Firestore order state becomes UNDELIVERED
+10. Manager dashboard shows all runs, progress, QR, print page, and POD viewer.
+
+Run Rules
+- Run Number is required
+- Run Number must be numeric only
+- Run Number length: 3 to 5 digits
+- Same run number can be reused on different dates
+- But for the same date, run number must be unique
+- If a run with the same number already exists today, user must delete old one before creating new one
+
+Run Expiry
+- Each run expires 48 hours after creation
+- Expired runs still appear in dashboard
+- Expired runs still show QR and print options
+- Driver run link should not be usable after expiry
+
+Driver UI Requirements
+- Mobile-first
+- Summary card at top
+- Tabs:
+  - Pending
+  - Delivered
+  - Undelivered
+- Show:
+  - total orders
+  - remaining orders
+  - PC undelivered
+  - progress bar
+- Order cards should be compact and visually consistent
+- Card content order:
+  - Order
+  - Suburb
+  - Street + Building merged on one line if possible
+  - Account Name
+  - PC / CP / PL / LP
+- Buttons on order detail page must be:
+  - NAVIGATE
+  - DELIVER
+  - NO DELIVERY
+
+Offline / Resilience
+- Driver page caches HTML in localStorage
+- If run is unavailable, app offers cached offline view
+- Offline mode is view-only fallback, not true offline sync
+
+Manager Dashboard Requirements
+- Show all runs
+- Order of runs:
+  1. Active runs first
+  2. Expired runs after
+  3. Newest first inside each group
+- For each run show:
+  - Run Number
+  - Driver Email
+  - Created time
+  - Expiry time
+  - Total orders
+  - Delivered count
+  - Remaining count
+  - Undelivered count
+  - Progress %
+  - QR code
+- Buttons:
+  - OPEN RUN
+  - VIEW POD
+  - PRINT QR
+  - DELETE RUN
+- Delete must require confirmation first
+
+POD Viewer Requirements
+- Manager can open a run detail page
+- Run detail page shows:
+  - Delivered orders
+  - Undelivered orders
+  - Pending orders
+- Delivered orders should show:
+  - POD photo links
+  - signature link if present
+  - delivered timestamp
+- Undelivered orders should show:
+  - reason
+  - note
+
+Print Requirements
+- One full printable page per run
+- Large QR code at top
+- Summary below:
+  - Run Number
+  - Driver Email
+  - Created time
+  - Expiry time
+  - Run link
+  - Total / Delivered / Remaining / Undelivered / Progress
+
+Firestore Data Shape
+Collection: runs
+Document ID: token
+
+Run doc fields:
+- created
+- expires_at
+- run_number
+- driver_email
+- pod_email
+- updated
+
+Subcollection: orders
+Document ID: order number
+
+Order fields:
+- _idx
+- Order
+- Account
+- Suburb
+- Street
+- Building
+- PC
+- CP
+- PL
+- LP
+- state
+- last_update
+- undelivered_reason
+- undelivered_note
+- pod_photos
+- signature_url
+- delivered_ts
+- undelivered_ts
+
+Current Important Constraints
+- Keep the app simple and prototype-friendly
+- Do not replace everything with a heavy frontend framework unless clearly necessary
+- Existing behavior and wording matter
+- The easter egg reason "I could not be bothered ..." is intentional and must stay
+- The run number and dashboard behavior are important business rules
+- Firestore must remain source of truth
+- Cloud Storage should store uploaded POD files
+
+What Codex Should Be Careful About
+- Do not break mobile browser file upload
+- Do not reintroduce broken HTML pattern validation for run number
+- Do not rely on RAM for run persistence
+- Be careful with JS inside Python f-strings
+- Preserve current routes where possible
+- Preserve current visual flow unless specifically asked to redesign
