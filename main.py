@@ -8,9 +8,14 @@ from datetime import datetime, timezone, timedelta
 from urllib.parse import quote_plus
 import base64
 import os
+from dotenv import load_dotenv
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
 
 from google.cloud import firestore
 from google.cloud import storage
+
+load_dotenv()
 
 
 app = FastAPI()
@@ -22,9 +27,9 @@ REQUIRED_COLS = [
     "Account Name", "Del Suburb", "Street", "Building"
 ]
 
-db = firestore.Client()
-gcs = storage.Client()
-POD_BUCKET = os.environ.get("POD_BUCKET", "")
+
+db: Optional[firestore.Client] = None
+gcs: Optional[storage.Client] = None
 
 
 def now_utc() -> datetime:
@@ -81,6 +86,9 @@ def qr_img(url: str, px: int = 220) -> str:
 
 
 def run_doc(token: str):
+    global db
+    if db is None:
+        db = firestore.Client()
     return db.collection("runs").document(token)
 
 
@@ -97,6 +105,9 @@ def save_run_to_firestore(
     pod_email: str,
     orders: list[dict]
 ):
+    global db
+    if db is None:
+        db = firestore.Client()
     run_doc(token).set({
         "created": created,
         "expires_at": expires_at,
@@ -138,13 +149,64 @@ def gcs_public_url(bucket: str, object_name: str) -> str:
     return f"https://storage.googleapis.com/{bucket}/{quote_plus(object_name)}"
 
 
-def upload_bytes_to_gcs(bucket: str, object_name: str, data: bytes, content_type: str) -> str:
+def upload_bytes_to_gcs(gcs_client: storage.Client, bucket: str, object_name: str, data: bytes, content_type: str) -> str:
     if not bucket:
         raise RuntimeError("POD_BUCKET env var is not set")
-    b = gcs.bucket(bucket)
+    if gcs_client is None:
+        gcs_client = storage.Client()
+    b = gcs_client.bucket(bucket)
     blob = b.blob(object_name)
     blob.upload_from_string(data, content_type=content_type)
     return gcs_public_url(bucket, object_name)
+
+
+def send_pod_email(
+    recipient: str,
+    run_number: str,
+    order_no: str,
+    delivered_ts: str,
+    photo_urls: list[str],
+    signature_url: Optional[str]
+) -> tuple[bool, str]:
+    if not recipient:
+        return False, "Recipient email is missing."
+
+    SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")
+    if not SENDGRID_API_KEY:
+        return False, "SENDGRID_API_KEY is not set."
+
+    pod_from_email = os.environ.get("POD_FROM_EMAIL", "").strip()
+    if not pod_from_email:
+        return False, "POD_FROM_EMAIL is not set."
+
+    subject = f"Proof of Delivery for Run {run_number}, Order {order_no}"
+    photo_html = "".join([f'<a href="{url}">Photo</a><br>' for url in photo_urls])
+    sig_html = f'<a href="{signature_url}">Signature</a><br>' if signature_url else "No signature"
+
+    html_content = f"""
+    <h2>Proof of Delivery</h2>
+    <p><b>Run Number:</b> {run_number}</p>
+    <p><b>Order Number:</b> {order_no}</p>
+    <p><b>Delivered At:</b> {delivered_ts}</p>
+    <br>
+    <p><b>Photos:</b><br>{photo_html}</p>
+    <p><b>Signature:</b><br>{sig_html}</p>
+    """
+
+    message = Mail(
+        from_email=pod_from_email,
+        to_emails=recipient,
+        subject=subject,
+        html_content=html_content
+    )
+    try:
+        sg = SendGridAPIClient(SENDGRID_API_KEY)
+        response = sg.send(message)
+        if 200 <= response.status_code < 300:
+            return True, ""
+        return False, f"SendGrid status code: {response.status_code}"
+    except Exception as e:
+        return False, f"Error sending email: {safe_str(e)}"
 
 
 def is_expired(run: dict) -> bool:
@@ -191,10 +253,14 @@ def load_run_cached(token: str) -> Optional[dict]:
 
 
 def delete_run_everywhere(token: str):
+    global gcs
+    POD_BUCKET = os.environ.get("POD_BUCKET", "")
     for s in run_doc(token).collection("orders").stream():
         s.reference.delete()
 
     if POD_BUCKET:
+        if gcs is None:
+            gcs = storage.Client()
         bucket = gcs.bucket(POD_BUCKET)
         prefix = f"runs/{token}/"
         blobs = list(gcs.list_blobs(bucket, prefix=prefix))
@@ -421,6 +487,9 @@ def home():
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin():
+    global db
+    if db is None:
+        db = firestore.Client()
     runs_html = ""
     try:
         snaps = db.collection("runs").order_by("updated", direction=firestore.Query.DESCENDING).limit(10).stream()
@@ -499,6 +568,9 @@ async def upload_run(
     driver_email: str = Form(""),
     pod_email: str = Form(...)
 ):
+    global db
+    if db is None:
+        db = firestore.Client()
     run_number = run_number.strip()
 
     if not run_number.isdigit() or len(run_number) < 3 or len(run_number) > 5:
@@ -929,6 +1001,8 @@ async def deliver_submit(
     photos: List[UploadFile] = File(...),
     signature_data: str = Form("")
 ):
+    global gcs
+    POD_BUCKET = os.environ.get("POD_BUCKET", "")
     run = load_run_cached(token)
     if not run:
         return HTMLResponse("<h3>Bad or expired link</h3>", status_code=404)
@@ -946,6 +1020,8 @@ async def deliver_submit(
 
     photo_urls = []
     idx = 0
+    if gcs is None:
+        gcs = storage.Client()
     for ph in photos:
         data = await ph.read()
         if not data:
@@ -953,7 +1029,7 @@ async def deliver_submit(
         idx += 1
         ctype = ph.content_type or "image/jpeg"
         obj = f"runs/{token}/orders/{order_no}/photos/{ts}_{idx}.jpg"
-        url = upload_bytes_to_gcs(POD_BUCKET, obj, data, content_type=ctype)
+        url = upload_bytes_to_gcs(gcs, POD_BUCKET, obj, data, content_type=ctype)
         photo_urls.append(url)
 
     if len(photo_urls) == 0:
@@ -966,17 +1042,31 @@ async def deliver_submit(
             sig_bytes = base64.b64decode(b64)
             if sig_bytes and len(sig_bytes) > 10:
                 obj = f"runs/{token}/orders/{order_no}/signature/{ts}.png"
-                signature_url = upload_bytes_to_gcs(POD_BUCKET, obj, sig_bytes, content_type="image/png")
+                signature_url = upload_bytes_to_gcs(gcs, POD_BUCKET, obj, sig_bytes, content_type="image/png")
         except Exception:
             signature_url = None
 
+    delivered_ts = now_utc_iso()
     update_order_firestore(token, order_no, {
         "state": "DELIVERED",
-        "delivered_ts": now_utc_iso(),
+        "delivered_ts": delivered_ts,
         "pod_photos": photo_urls,
         "signature_url": signature_url,
         "undelivered_reason": None,
         "undelivered_note": None,
+    })
+
+    email_ok, email_error = send_pod_email(
+        recipient=safe_str(run.get("pod_email")),
+        run_number=safe_str(run.get("run_number")),
+        order_no=order_no,
+        delivered_ts=delivered_ts,
+        photo_urls=photo_urls,
+        signature_url=signature_url,
+    )
+    update_order_firestore(token, order_no, {
+        "pod_email_status": "SENT" if email_ok else "FAILED",
+        "pod_email_error": None if email_ok else email_error,
     })
 
     RUNS_CACHE.pop(token, None)
@@ -1049,6 +1139,9 @@ async def undeliver_submit(
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard(request: Request):
+    global db
+    if db is None:
+        db = firestore.Client()
     base = get_base_url(request)
     rows = []
 
